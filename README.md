@@ -1,25 +1,69 @@
-# Maritime_SAR_Planning
+# Maritime SAR Planning
 
-## Data
+Algorithms for decision-making in maritime search and rescue operations using oceanographic forecasts.
 
-### NetCDF File Variables
+## Overview
 
-The project uses NetCDF files containing oceanographic data from FVCOM (Finite Volume Coastal Ocean Model).
+This project loads FVCOM ocean current forecasts and interpolates them to a regular geographic grid for SAR planning algorithms.
 
-#### Current Velocity Variables
-- **`u`**: Eastward water velocity (meters/second)
-  - Range: -1.70 to 1.39 m/s
-  - Dimensions: (time, siglay, nele)
-  
-- **`v`**: Northward water velocity (meters/second)
-  - Range: -1.20 to 1.34 m/s
-  - Dimensions: (time, siglay, nele)
+**Key Components:**
+- `GridWorld`: Regular lat/lon grid with configurable cell size
+- `Currents`: Loads NetCDF forecasts and interpolates to grid points
+- Visualization: Maps current speed and direction over time
 
-**Derived Quantities:**
-- Current speed: √(u² + v²)
-- Current direction: atan2(v, u) (in radians)
+## Quick Start
 
-#### Dimensions
-- **time**: Time steps
-- **siglay**: Sigma layers (vertical levels, 20 in sample data)
-- **nele**: Grid elements/cells (102,264 in sample data)
+```python
+from grid_world import GridWorld
+from currents import Currents
+
+# Create grid (SF Bay area, 500m cells)
+grid = GridWorld(37.7, 37.9, -122.7, -122.4, cell_size_m=500)
+
+# Load currents and interpolate
+currents = Currents("data/sfbofs.t15z.20251105.stations.forecast.nc")
+grid = currents.populate_gridworld(grid)
+```
+
+## Visualizations
+
+Three visualization modes for current analysis:
+
+1. **Station Vectors** - Raw forecast data at station locations
+   ```python
+   from visualizations.prototype_drift import visualize_station_vectors
+   fig, ax = visualize_station_vectors(grid, currents, time_step=0)
+   ```
+
+2. **Vector Field** - Interpolated vectors on GridWorld points
+   ```python
+   from visualizations.prototype_drift import visualize_vector_field
+   fig, ax = visualize_vector_field(grid, currents, time_step=0)
+   ```
+
+3. **Batch Generation** - Generate visualizations for multiple time steps
+   ```bash
+   python visualizations/prototype_drift.py
+   ```
+
+All vectors show **1-hour drift** for SAR planning.
+
+## Data Format
+
+NetCDF files from FVCOM contain:
+- **`u`, `v`**: Eastward/northward velocity (m/s) at surface layer
+- **`lon`, `lat`** (or `lonc`, `latc`): Station/element coordinates
+- **`Times`** (or `time`): Time steps
+
+## Project Structure
+
+```
+src/
+  ├── grid_world.py          # Regular geographic grid
+  ├── currents.py            # Forecast loading and interpolation
+visualizations/
+  └── prototype_drift.py     # Station and vector field visualizations
+data/
+  ├── *.nc                   # NetCDF forecast files
+  └── ca_shoreline.geojson   # CA coastline boundaries
+```
