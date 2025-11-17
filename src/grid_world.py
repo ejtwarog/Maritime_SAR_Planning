@@ -142,30 +142,3 @@ class GridWorld:
             'lat_range': self.max_lat - self.min_lat,
             'lon_range': self.max_lon - self.min_lon
         }
-
-
-if __name__ == "__main__":
-    # Example usage
-    # San Francisco Bay Area bounds
-    min_lat, max_lat = 37.746386588546684, 37.84169189475321
-    min_lon, max_lon = -122.63743707976295, -122.42795905807327
-    
-    # Create grid world with 10m cells
-    grid = GridWorld(min_lat, max_lat, min_lon, max_lon, cell_size_m=100)
-    
-    # Get grid info
-    print("Grid World Info:")
-    print(grid.get_info())
-    
-    # Get grid points
-    lats, lons = grid.get_grid_points()
-    print(f"\nTotal grid points: {len(lats)}")
-    print(f"First 5 points (lat, lon):")
-    for i in range(5):
-        print(f"  ({lats[i]:.4f}, {lons[i]:.4f})")
-    
-    # Get cell at specific location
-    test_lat, test_lon = 37.5, -122.5
-    i, j = grid.get_cell_at_location(test_lat, test_lon)
-    cell_lat, cell_lon = grid.get_cell_at_index(i, j)
-    print(f"\nClosest cell to ({test_lat}, {test_lon}): ({cell_lat:.4f}, {cell_lon:.4f})")

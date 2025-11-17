@@ -1,7 +1,13 @@
+import json
+
 import numpy as np
 import xarray as xr
 from scipy.interpolate import griddata
 from typing import Tuple
+
+from shapely.geometry import shape
+from shapely.ops import unary_union
+from shapely import vectorized
 
 try:
     from .grid_world import GridWorld
@@ -21,6 +27,7 @@ class Currents:
         """
         self.forecast_file = forecast_file
         self.ds = xr.open_dataset(forecast_file)
+        self.land_geometry = None
         self._extract_forecast_data()
     
     def _extract_forecast_data(self):
@@ -54,10 +61,71 @@ class Currents:
         direction = (direction + 360) % 360  # Normalize to 0-360
         return speed, direction
     
-    def populate_gridworld(self, grid: GridWorld) -> GridWorld:
-        """Interpolate forecast currents to GridWorld."""
-        grid_lat, grid_lon = grid.get_grid_points()
-        bounds = grid.get_bounds()
+    def load_land_geometry(self, geojson_path: str) -> None:
+        """Load land geometry from a GeoJSON file and cache as a unary union geometry."""
+        if self.land_geometry is not None:
+            return
+
+        try:
+            with open(geojson_path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            self.land_geometry = None
+            return
+
+        features = data.get("features", [])
+        if not features:
+            self.land_geometry = None
+            return
+
+        geometries = []
+        for feature in features:
+            geom_data = feature.get("geometry")
+            if geom_data is None:
+                continue
+            geometries.append(shape(geom_data))
+
+        if not geometries:
+            self.land_geometry = None
+            return
+
+        self.land_geometry = unary_union(geometries)
+
+    def mask_on_land(self, lon: np.ndarray, lat: np.ndarray,
+                     u: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Zero-out u, v where (lon, lat) fall on cached land geometry, if available."""
+        if self.land_geometry is None:
+            return u, v
+
+        on_land = vectorized.contains(self.land_geometry, lon, lat)
+        u = u.copy()
+        v = v.copy()
+        u[on_land] = 0.0
+        v[on_land] = 0.0
+        return u, v
+
+    def is_on_land(self, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+        """Return boolean mask indicating which positions lie on cached land geometry."""
+        if self.land_geometry is None:
+            return np.zeros_like(lon, dtype=bool)
+        return vectorized.contains(self.land_geometry, lon, lat)
+    
+    def interpolate_to_grid(self, grid_lon: np.ndarray, grid_lat: np.ndarray, 
+                           time_step: int, method: str = 'linear') -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Interpolate u, v components to grid points at a specific time step.
+        
+        Args:
+            grid_lon: Grid longitude points (1D or flattened)
+            grid_lat: Grid latitude points (1D or flattened)
+            time_step: Time index to interpolate
+            method: Interpolation method ('linear', 'nearest', 'cubic')
+        
+        Returns:
+            Tuple of (u_grid, v_grid) interpolated to grid points
+        """
+        bounds = {'min_lat': grid_lat.min(), 'max_lat': grid_lat.max(),
+                  'min_lon': grid_lon.min(), 'max_lon': grid_lon.max()}
         
         # Filter stations within bounds
         mask = (
@@ -70,8 +138,60 @@ class Currents:
             raise ValueError("No forecast stations within grid bounds")
         
         # Get bounded station data
-        lon, lat = self.station_lon[mask], self.station_lat[mask]
-        u_bounded, v_bounded = self.u[:, mask], self.v[:, mask]
+        station_lon, station_lat = self.station_lon[mask], self.station_lat[mask]
+        u_station = self.u[time_step, mask]
+        v_station = self.v[time_step, mask]
+        
+        # Interpolate to grid
+        u_grid = griddata((station_lon, station_lat), u_station, (grid_lon, grid_lat), method=method)
+        v_grid = griddata((station_lon, station_lat), v_station, (grid_lon, grid_lat), method=method)
+        
+        return u_grid, v_grid
+    
+    def interpolate_speed_direction_to_grid(self, grid_lon: np.ndarray, grid_lat: np.ndarray,
+                                           time_step: int, method: str = 'nearest') -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Interpolate speed and direction to grid points at a specific time step.
+        
+        Args:
+            grid_lon: Grid longitude points (1D or flattened)
+            grid_lat: Grid latitude points (1D or flattened)
+            time_step: Time index to interpolate
+            method: Interpolation method ('linear', 'nearest', 'cubic')
+        
+        Returns:
+            Tuple of (speed_grid, direction_grid) interpolated to grid points
+        """
+        bounds = {'min_lat': grid_lat.min(), 'max_lat': grid_lat.max(),
+                  'min_lon': grid_lon.min(), 'max_lon': grid_lon.max()}
+        
+        # Filter stations within bounds
+        mask = (
+            (self.station_lat >= bounds['min_lat']) & 
+            (self.station_lat <= bounds['max_lat']) &
+            (self.station_lon >= bounds['min_lon']) & 
+            (self.station_lon <= bounds['max_lon'])
+        )
+        if not np.any(mask):
+            raise ValueError("No forecast stations within grid bounds")
+        
+        # Get bounded station data
+        station_lon, station_lat = self.station_lon[mask], self.station_lat[mask]
+        u_station = self.u[time_step, mask]
+        v_station = self.v[time_step, mask]
+        
+        # Calculate speed and direction at stations
+        speed_station, direction_station = self._calculate_speed_direction(u_station, v_station)
+        
+        # Interpolate to grid
+        speed_grid = griddata((station_lon, station_lat), speed_station, (grid_lon, grid_lat), method=method)
+        direction_grid = griddata((station_lon, station_lat), direction_station, (grid_lon, grid_lat), method=method)
+        
+        return speed_grid, direction_grid
+    
+    def populate_gridworld(self, grid: GridWorld) -> GridWorld:
+        """Interpolate forecast currents to GridWorld for all time steps."""
+        grid_lat, grid_lon = grid.get_grid_points()
         
         # Initialize storage
         grid.current_speed = {}
@@ -79,9 +199,8 @@ class Currents:
         
         # Interpolate for each time step
         for t in range(self.n_times):
-            speed_t, direction_t = self._calculate_speed_direction(u_bounded[t], v_bounded[t])
-            grid.current_speed[t] = griddata((lon, lat), speed_t, (grid_lon, grid_lat), method='nearest')
-            grid.current_direction[t] = griddata((lon, lat), direction_t, (grid_lon, grid_lat), method='nearest')
+            grid.current_speed[t], grid.current_direction[t] = \
+                self.interpolate_speed_direction_to_grid(grid_lon, grid_lat, t, method='nearest')
         
         return grid
     

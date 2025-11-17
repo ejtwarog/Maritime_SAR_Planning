@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.interpolate import griddata
 import sys
 from pathlib import Path
 
@@ -37,6 +36,15 @@ def _set_extent(ax, bounds, use_map):
         ax.set_ylim(bounds['min_lat'], bounds['max_lat'])
 
 
+def _scale_uv_to_degrees(u: np.ndarray, v: np.ndarray, lat: np.ndarray) -> tuple:
+    """Scale u, v components from m/s to degrees/hour for visualization."""
+    lat_mean = np.mean(lat)
+    m_per_deg_lon = 111320 * np.cos(np.radians(lat_mean))
+    m_per_deg_lat = 111320
+    u_deg, v_deg = u / m_per_deg_lon, v / m_per_deg_lat
+    return u_deg * 3600, v_deg * 3600
+
+
 def visualize_station_vectors(grid: GridWorld, currents: Currents, time_step: int = 0, figsize=(12, 8), use_map: bool = True):
     """Visualize current vectors at forecast stations within grid bounds."""
     fig, ax = _setup_map(figsize, use_map)
@@ -58,12 +66,8 @@ def visualize_station_vectors(grid: GridWorld, currents: Currents, time_step: in
                         edgecolors='white', linewidth=1.5, alpha=0.95, zorder=3)
     plt.colorbar(scatter, ax=ax, label='Speed (m/s)').ax.tick_params(labelsize=10)
     
-    # Convert to degrees and scale for 1-hour drift
-    lat_mean = np.mean(lat)
-    m_per_deg_lon = 111320 * np.cos(np.radians(lat_mean))
-    m_per_deg_lat = 111320
-    u_deg, v_deg = u / m_per_deg_lon, v / m_per_deg_lat
-    u_scaled, v_scaled = u_deg * 3600, v_deg * 3600
+    # Scale for 1-hour drift visualization
+    u_scaled, v_scaled = _scale_uv_to_degrees(u, v, lat)
     
     # Plot vectors with outline
     ax.quiver(lon, lat, u_scaled, v_scaled, scale=1, scale_units='xy', angles='xy',
@@ -86,20 +90,8 @@ def visualize_vector_field(grid: GridWorld, currents: Currents, time_step: int =
     grid_lat, grid_lon = grid.get_grid_points()
     grid_shape = grid.get_grid_shape()
     
-    bounds = grid.get_bounds()
-    mask = (
-        (currents.station_lat >= bounds['min_lat']) & 
-        (currents.station_lat <= bounds['max_lat']) &
-        (currents.station_lon >= bounds['min_lon']) & 
-        (currents.station_lon <= bounds['max_lon'])
-    )
-    
     # Interpolate station data to grid
-    station_lon, station_lat = currents.station_lon[mask], currents.station_lat[mask]
-    u_station, v_station = currents.u[time_step, mask], currents.v[time_step, mask]
-    
-    u_grid = griddata((station_lon, station_lat), u_station, (grid_lon, grid_lat), method='linear')
-    v_grid = griddata((station_lon, station_lat), v_station, (grid_lon, grid_lat), method='linear')
+    u_grid, v_grid = currents.interpolate_to_grid(grid_lon, grid_lat, time_step, method='linear')
     speed_grid = np.sqrt(u_grid**2 + v_grid**2)
     
     # Reshape for plotting
@@ -111,12 +103,8 @@ def visualize_vector_field(grid: GridWorld, currents: Currents, time_step: int =
     im = ax.contourf(lon_2d, lat_2d, speed_2d, levels=20, cmap='viridis', alpha=0.7)
     plt.colorbar(im, ax=ax, label='Speed (m/s)')
     
-    # Convert to degrees and scale
-    lat_mean = np.mean(grid_lat)
-    m_per_deg_lon = 111320 * np.cos(np.radians(lat_mean))
-    m_per_deg_lat = 111320
-    u_scaled = (u_2d / m_per_deg_lon) * 3600
-    v_scaled = (v_2d / m_per_deg_lat) * 3600
+    # Scale for visualization
+    u_scaled, v_scaled = _scale_uv_to_degrees(u_2d, v_2d, grid_lat)
     
     # Plot vectors with outline (subsample for clarity)
     subsample = 3
@@ -127,6 +115,7 @@ def visualize_vector_field(grid: GridWorld, currents: Currents, time_step: int =
               u_scaled[::subsample, ::subsample], v_scaled[::subsample, ::subsample],
               scale=1, scale_units='xy', angles='xy', width=0.004, color='red', alpha=0.95, zorder=4)
     
+    bounds = grid.get_bounds()
     _set_extent(ax, bounds, use_map)
     ax.set_xlabel('Longitude')
     ax.set_ylabel('Latitude')
