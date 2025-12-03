@@ -49,14 +49,10 @@ class DriftObjectCollection:
         return np.stack([lon, lat], axis=-1)
 
     def step(self, currents: Currents, time_idx: int, dt: float) -> None:
-        """Advance all objects one step using the given Currents and time index.
-
-        dt is in seconds.
-        """
+        """Advance all objects one step. dt in seconds."""
         if not self.objects:
             return
 
-        # Only advect objects that have been "released" by this time step
         created_times = np.array([o.created_time_idx for o in self.objects])
         active_mask = created_times <= time_idx
         if not np.any(active_mask):
@@ -76,17 +72,12 @@ class DriftObjectCollection:
 
         u_interp = np.nan_to_num(u_interp, nan=0.0)
         v_interp = np.nan_to_num(v_interp, nan=0.0)
-
         u_interp, v_interp = currents.mask_on_land(lon_active, lat_active, u_interp, v_interp)
-        
-        # Add stochastic noise: direction (mean 0, std 10 degrees) and speed (+/-10%)
-        speed = np.sqrt(u_interp ** 2 + v_interp ** 2)
-        direction = np.arctan2(v_interp, u_interp)  # radians
 
+        speed = np.sqrt(u_interp ** 2 + v_interp ** 2)
+        direction = np.arctan2(v_interp, u_interp)
         angle_noise_deg = np.random.normal(loc=0.0, scale=10.0, size=speed.shape)
         angle_noise_rad = np.deg2rad(angle_noise_deg)
-
-        # Speed noise as multiplicative factor around 1.0 with ~10% std
         speed_factor = np.random.normal(loc=1.0, scale=0.1, size=speed.shape)
         speed_factor = np.clip(speed_factor, 0.0, None)
 
@@ -104,7 +95,6 @@ class DriftObjectCollection:
         new_lon_active = lon_active + u_deg * dt
         new_lat_active = lat_active + v_deg * dt
 
-        # Write back updated positions only for active objects
         active_indices = np.where(active_mask)[0]
         for idx_array, obj_idx in enumerate(active_indices):
             obj = self.objects[obj_idx]

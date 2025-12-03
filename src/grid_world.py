@@ -13,14 +13,7 @@ class GridWorld:
         max_lon: float,
         cell_size_m: float = 100
     ):
-        """
-        Initialize grid world.
-        
-        Args:
-            min_lat, max_lat: Latitude bounds (degrees)
-            min_lon, max_lon: Longitude bounds (degrees)
-            cell_size_m: Grid cell size in meters (default: 100m)
-        """
+        """Initialize grid within lat/lon bounds with given cell size (meters)."""
         if min_lat >= max_lat:
             raise ValueError("min_lat must be less than max_lat")
         if min_lon >= max_lon:
@@ -34,26 +27,16 @@ class GridWorld:
         self.max_lon = max_lon
         self.cell_size_m = cell_size_m
         
-        # Earth's radius in meters
         self.earth_radius_m = 6371000
-        
-        # Calculate grid dimensions
         self._calculate_grid_dimensions()
-        
-        # Generate grid points
         self._generate_grid()
     
     def _calculate_grid_dimensions(self):
         """Calculate grid dimensions in cells."""
-        # Convert lat/lon differences to approximate meters
         lat_diff_m = self._lat_to_meters(self.max_lat - self.min_lat)
         lon_diff_m = self._lon_to_meters(self.max_lon - self.min_lon, self.min_lat)
-        
-        # Calculate number of cells
         self.n_cells_lat = int(np.ceil(lat_diff_m / self.cell_size_m))
         self.n_cells_lon = int(np.ceil(lon_diff_m / self.cell_size_m))
-        
-        # Total number of grid points
         self.n_cells = self.n_cells_lat * self.n_cells_lon
     
     def _lat_to_meters(self, lat_diff: float) -> float:
@@ -74,24 +57,15 @@ class GridWorld:
     
     def _generate_grid(self):
         """Generate grid points in lat/lon coordinates."""
-        # Calculate actual spacing in lat/lon
         lat_spacing = self._meters_to_lat(self.cell_size_m)
         lon_spacing = self._meters_to_lon(self.cell_size_m, (self.min_lat + self.max_lat) / 2)
-        
-        # Generate grid points
         lats = np.arange(self.min_lat, self.max_lat, lat_spacing)
         lons = np.arange(self.min_lon, self.max_lon, lon_spacing)
-        
-        # Ensure we include the boundaries
         if lats[-1] < self.max_lat:
             lats = np.append(lats, self.max_lat)
         if lons[-1] < self.max_lon:
             lons = np.append(lons, self.max_lon)
-        
-        # Create meshgrid
         self.lon_grid, self.lat_grid = np.meshgrid(lons, lats)
-        
-        # Flatten to get list of points
         self.points_lat = self.lat_grid.flatten()
         self.points_lon = self.lon_grid.flatten()
         self.n_cells = len(self.points_lat)
@@ -110,17 +84,11 @@ class GridWorld:
     
     def get_cell_at_location(self, lat: float, lon: float) -> Tuple[int, int]:
         """Get (i, j) indices of closest grid cell to (lat, lon)."""
-        # Find closest point
-        distances = np.sqrt(
-            (self.points_lat - lat)**2 + (self.points_lon - lon)**2
-        )
+        distances = np.sqrt((self.points_lat - lat)**2 + (self.points_lon - lon)**2)
         closest_idx = np.argmin(distances)
-        
-        # Convert flat index to 2D indices
         shape = self.lat_grid.shape
         i = closest_idx // shape[1]
         j = closest_idx % shape[1]
-        
         return i, j
     
     def get_bounds(self) -> dict:
