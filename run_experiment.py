@@ -22,7 +22,7 @@ import numpy as np
 from simulation_scene import SearchSimulation
 from search_algorithms import (
     TrivialGreedySearchAlgorithm,
-    SearchAlgorithm,
+    SearchAlgorithm, RolloutPolicySearchAlgorithm,
 )
 from drift_object import DriftObjectCollection
 from currents import Currents
@@ -110,6 +110,7 @@ def get_algorithm(name: str) -> SearchAlgorithm:
     """Get search algorithm by name."""
     algorithms = {
         "trivial_greedy": TrivialGreedySearchAlgorithm,
+        "rollout_policy": RolloutPolicySearchAlgorithm,
     }
 
     if name not in algorithms:
@@ -286,7 +287,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--algorithm",
         default="trivial_greedy",
-        choices=["trivial_greedy"],
+        choices=["trivial_greedy", "rollout_policy"],
         help="Search algorithm",
     )
     parser.add_argument(
