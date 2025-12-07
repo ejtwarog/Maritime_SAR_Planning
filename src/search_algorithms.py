@@ -139,7 +139,7 @@ class RolloutPolicySearchAlgorithm(SearchAlgorithm):
         with highest average simulated return.
     """
 
-    def __init__(self, horizon: int = 8, n_rollouts: int = 8, pod: float = 0.8):
+    def __init__(self, horizon: int = 8, n_rollouts: int = 6, pod: float = 0.8):
         # Search state
         self.current_lat_idx = None
         self.current_lon_idx = None
@@ -191,7 +191,7 @@ class RolloutPolicySearchAlgorithm(SearchAlgorithm):
         MIN_START_FRAC = 1e-3
         min_start_prob = MIN_START_FRAC * max_prob
 
-        gamma = 0.93  # discount factor for steps into the future
+        gamma = 0.92  # discount factor for steps into the future
 
         best_value = -1e9
         best_next_cell = None
@@ -233,7 +233,28 @@ class RolloutPolicySearchAlgorithm(SearchAlgorithm):
                 # Simulate the rest of the horizon with random actions
                 discount = gamma
                 for _ in range(self.horizon - 1):
-                    a2 = np.random.choice(ACTIONS)
+                    neighbor_actions = []
+                    neighbor_weights = []
+
+                    for a2 in ACTIONS:
+                        dr2, dc2 = DELTAS[a2]
+                        rr = int(np.clip(r + dr2, 0, H - 1))
+                        cc = int(np.clip(c + dc2, 0, W - 1))
+                        if 0 <= rr < H and 0 <= cc < W and not visited[rr, cc]:
+                            w = max(b[rr, cc], 0.0)  # belief as weight
+                            neighbor_actions.append(a2)
+                            neighbor_weights.append(w)
+
+                    if neighbor_actions:
+                        probs = np.array(neighbor_weights)
+                        if probs.sum() > 0:
+                            probs /= probs.sum()
+                            a2 = np.random.choice(neighbor_actions, p=probs)
+                        else:
+                            a2 = np.random.choice(neighbor_actions)
+                    else:
+                        a2 = np.random.choice(ACTIONS)
+                        
                     dr2, dc2 = DELTAS[a2]
 
                     r = int(np.clip(r + dr2, 0, H - 1))
@@ -244,7 +265,8 @@ class RolloutPolicySearchAlgorithm(SearchAlgorithm):
                         not visited[r, c] and
                         np.isfinite(b[r, c]) and b[r, c] > 0.0
                     ):
-                        rollout_reward += discount * (self.pod * b[r, c])
+                        STEP_COST = 0.001 # penalty for moving to a cell with low probability
+                        rollout_reward += discount * (self.pod * b[r, c] - STEP_COST)
                         visited[r, c] = True
                         b[r, c] = b[r, c] * (1.0 - self.pod)
 
