@@ -48,6 +48,55 @@ class DriftObjectCollection:
         lat = np.array([o.lat for o in self.objects])
         return np.stack([lon, lat], axis=-1)
 
+    def remove_objects_in_cells(self, cells: List[tuple], lat_edges: np.ndarray, 
+                                lon_edges: np.ndarray, pod: float) -> int:
+        """Remove objects in searched cells based on probability of detection.
+        
+        For each object in a searched cell, remove it with probability = pod.
+        
+        Args:
+            cells: List of (lat_idx, lon_idx) tuples representing searched cells
+            lat_edges: Latitude bin edges
+            lon_edges: Longitude bin edges
+            pod: Probability of detection (0 to 1)
+            
+        Returns:
+            Number of objects removed
+        """
+        if not cells or pod <= 0:
+            return 0
+        
+        # Get current positions
+        positions = self.get_positions()
+        if positions.shape[0] == 0:
+            return 0
+        
+        lon = positions[:, 0]
+        lat = positions[:, 1]
+        
+        # Find which objects are in searched cells
+        objects_to_remove = []
+        
+        for obj_idx, (obj_lon, obj_lat) in enumerate(zip(lon, lat)):
+            if np.isnan(obj_lon) or np.isnan(obj_lat):
+                continue
+            
+            # Find which cell this object is in
+            lat_idx = np.searchsorted(lat_edges, obj_lat) - 1
+            lon_idx = np.searchsorted(lon_edges, obj_lon) - 1
+            
+            # Check if this cell was searched
+            if (lat_idx, lon_idx) in cells:
+                # Remove with probability = pod
+                if np.random.random() < pod:
+                    objects_to_remove.append(obj_idx)
+        
+        # Remove objects in reverse order to maintain indices
+        for obj_idx in sorted(objects_to_remove, reverse=True):
+            self.objects.pop(obj_idx)
+        
+        return len(objects_to_remove)
+
     def step(self, currents: Currents, time_idx: int, dt: float) -> None:
         """Advance all objects one step. dt in seconds."""
         if not self.objects:

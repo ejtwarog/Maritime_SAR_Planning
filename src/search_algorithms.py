@@ -101,9 +101,9 @@ class TrivialGreedySearchAlgorithm(SearchAlgorithm):
         cells = []
 
         for _ in range(depth):
-            # Add current cell if not already searched
-            if (self.current_lat_idx, self.current_lon_idx) not in searched_cells:
-                cells.append((self.current_lat_idx, self.current_lon_idx))
+            # Always record current cell in this step's path (even if searched before)
+            # This ensures continuous path visualization
+            cells.append((self.current_lat_idx, self.current_lon_idx))
 
             # Get neighbors: up, down, left, right
             neighbors = [
@@ -140,7 +140,6 @@ class TrivialGreedySearchAlgorithm(SearchAlgorithm):
 
 from typing import Callable, Optional, Set, List, Tuple
 import numpy as np
-
 
 class RolloutPolicySearchAlgorithm(SearchAlgorithm):
     """
@@ -314,9 +313,9 @@ class RolloutPolicySearchAlgorithm(SearchAlgorithm):
         for _ in range(depth):
             current_cell = (self.current_lat_idx, self.current_lon_idx)
 
-            # Record current cell if not already searched
-            if current_cell not in searched_cells:
-                cells.append(current_cell)
+            # Always record current cell in this step's path (even if searched before)
+            # This ensures continuous path visualization
+            cells.append(current_cell)
 
             # Use rollout-based policy to choose next cell
             next_cell = self._rollout_policy(
@@ -426,6 +425,9 @@ class MCTSSearchAlgorithm(SearchAlgorithm):
                 if not neighbors:
                     break
 
+                # Record current node in path for backpropagation
+                path.append(node_key)
+
                 if not node.children:
                     # expansion
                     dlat, dlon, nlat, nlon = random.choice(neighbors)
@@ -435,7 +437,6 @@ class MCTSSearchAlgorithm(SearchAlgorithm):
 
                     lat_idx, lon_idx = nlat, nlon
                     depth += 1
-                    path.append((node_key, (dlat, dlon), (lat_idx, lon_idx)))
 
                     if (lat_idx, lon_idx) not in sim_visited:
                         sim_reward += probability_surface[lat_idx, lon_idx]
@@ -468,7 +469,6 @@ class MCTSSearchAlgorithm(SearchAlgorithm):
                 lat_idx += dlat
                 lon_idx += dlon
                 depth += 1
-                path.append((node_key, (dlat, dlon), (lat_idx, lon_idx)))
 
                 if (lat_idx, lon_idx) not in sim_visited:
                     sim_reward += probability_surface[lat_idx, lon_idx]
@@ -493,7 +493,7 @@ class MCTSSearchAlgorithm(SearchAlgorithm):
                     sim_visited.add((lat_idx, lon_idx))
 
             # Backpropagation
-            for nk, _, _ in path:
+            for nk in path:
                 node_back = get_node(nk)
                 node_back.N += 1
                 node_back.Q += sim_reward
@@ -567,16 +567,177 @@ class MCTSSearchAlgorithm(SearchAlgorithm):
             searched_cells=searched_cells,
         )
 
-        if not planned:
-            return []
+        # Build output: always include current cell first, then planned path
+        output = [start_cell]
+        if planned:
+            # Take at most (depth - 1) additional steps to stay within depth budget
+            output.extend(planned[:depth - 1])
 
-        # Take at most `depth` steps from the planned path
-        output = planned[:depth]
-        if not output:
-            return []
+        # Trim to exactly depth steps
+        output = output[:depth]
 
         # Update internal position and visited set
-        self.current_lat_idx, self.current_lon_idx = output[-1]
-        self.internal_visited.update(output)
+        if len(output) > 0:
+            self.current_lat_idx, self.current_lon_idx = output[-1]
+            self.internal_visited.update(output)
+
+        return output
+
+
+class ParallelTrackSearchAlgorithm(SearchAlgorithm):
+    """
+    Hard-coded parallel track search pattern for crewed platform.
+    
+    Starts from the Gaussian distribution origin and searches in the current direction.
+    Each search leg is 1.5x the depth. After each leg, creeps south (perpendicular to current)
+    to search immediately adjacent cells.
+    
+    Maintains continuity across search steps.
+    """
+
+    def __init__(
+        self,
+        center_lat: float = None,
+        center_lon: float = None,
+        current_direction: float = 0.0,
+    ):
+        """
+        Initialize parallel track search.
+        
+        Args:
+            center_lat: Starting latitude (Gaussian origin). If None, will use grid center.
+            center_lon: Starting longitude (Gaussian origin). If None, will use grid center.
+            current_direction: Direction of current/drift in degrees (0°=East, 90°=North, etc.)
+        """
+        self.center_lat = center_lat
+        self.center_lon = center_lon
+        self.current_direction = current_direction
+        self.pattern_generated = False
+        self.search_pattern = []
+        self.pattern_index = 0
+
+    def _generate_pattern(
+        self,
+        lat_edges: np.ndarray,
+        lon_edges: np.ndarray,
+        depth: int,
+    ):
+        """Generate the parallel track search pattern with no gaps between tracks."""
+        if self.pattern_generated:
+            return
+
+        # Determine starting position
+        if self.center_lat is None or self.center_lon is None:
+            center_lat = 0.5 * (lat_edges[0] + lat_edges[-1])
+            center_lon = 0.5 * (lon_edges[0] + lon_edges[-1])
+        else:
+            center_lat = self.center_lat
+            center_lon = self.center_lon
+
+        # Convert center to grid indices
+        start_lat_idx, start_lon_idx = self._get_cell_indices(
+            center_lat, center_lon, lat_edges, lon_edges
+        )
+        if start_lat_idx == -1 or start_lon_idx == -1:
+            self.pattern_generated = True
+            return
+
+        # Current direction: convert degrees to lat/lon deltas
+        # 0° = East (lon+), 90° = North (lat+), 180° = West (lon-), 270° = South (lat-)
+        current_rad = np.radians(self.current_direction)
+        current_dlat = np.sin(current_rad)  # North component
+        current_dlon = np.cos(current_rad)  # East component
+
+        # Perpendicular direction (90° clockwise = south relative to current)
+        # This is the direction between adjacent tracks (no gaps)
+        perp_rad = current_rad - np.pi / 2  # 90° clockwise
+        perp_dlat = np.sin(perp_rad)  # South component
+        perp_dlon = np.cos(perp_rad)  # East component
+
+        n_lat, n_lon = len(lat_edges) - 1, len(lon_edges) - 1
+
+        # Leg length is 2.0x depth
+        leg_length = int(depth * 2.5)
+
+        # Generate pattern: multiple legs with adjacent tracks (1 cell spacing)
+        # Legs alternate direction for efficient coverage
+        pattern = []
+        leg_num = 0
+        current_lat_idx = start_lat_idx + 5  # Shift origin 5 cells higher
+        current_lon_idx = start_lon_idx
+        leg_dlat = current_dlat
+        leg_dlon = current_dlon
+        
+        # Use floating point accumulators to handle fractional movements
+        lat_accum = float(current_lat_idx)
+        lon_accum = float(current_lon_idx)
+
+        while True:
+            # Generate one leg in the current leg direction
+            for step in range(leg_length):
+                # Accumulate fractional movements
+                lat_accum += leg_dlat
+                lon_accum += leg_dlon
+                
+                # Convert to integer indices
+                next_lat_idx = int(np.clip(lat_accum, 0, n_lat - 1))
+                next_lon_idx = int(np.clip(lon_accum, 0, n_lon - 1))
+
+                # Always add cell to maintain continuous path through all cells
+                pattern.append((next_lat_idx, next_lon_idx))
+
+                # Stop if we've hit a boundary
+                if (next_lat_idx, next_lon_idx) == (current_lat_idx, current_lon_idx):
+                    break
+
+                current_lat_idx = next_lat_idx
+                current_lon_idx = next_lon_idx
+
+            # After completing a leg, move perpendicular (south) by 1 cell for adjacent track
+            lat_accum += perp_dlat
+            lon_accum += perp_dlon
+            current_lat_idx = int(np.clip(lat_accum, 0, n_lat - 1))
+            current_lon_idx = int(np.clip(lon_accum, 0, n_lon - 1))
+
+            # Reverse direction for next leg (boustrophedon pattern)
+            leg_dlat = -leg_dlat
+            leg_dlon = -leg_dlon
+
+            leg_num += 1
+            if leg_num > 20 or len(pattern) >= leg_length * 20:
+                break
+
+        self.search_pattern = pattern
+        self.pattern_generated = True
+
+    def search(
+        self,
+        probability_surface: np.ndarray,
+        lat_edges: np.ndarray,
+        lon_edges: np.ndarray,
+        start_lat: float,
+        start_lon: float,
+        depth: int,
+        searched_cells: set = None,
+    ) -> List[Tuple[int, int]]:
+        """
+        Return pre-computed parallel track search pattern up to depth cells.
+        
+        Maintains continuity by continuing from where the previous search ended.
+        """
+        if searched_cells is None:
+            searched_cells = set()
+
+        # Generate pattern on first call
+        self._generate_pattern(lat_edges, lon_edges, depth)
+
+        # Return pattern starting from current index, up to depth cells
+        # Include all cells in the pattern regardless of whether they've been searched
+        # to maintain continuous path through the search area
+        output = []
+        while self.pattern_index < len(self.search_pattern) and len(output) < depth:
+            lat_idx, lon_idx = self.search_pattern[self.pattern_index]
+            output.append((lat_idx, lon_idx))
+            self.pattern_index += 1
 
         return output

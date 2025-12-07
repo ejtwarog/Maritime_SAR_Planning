@@ -25,6 +25,7 @@ from search_algorithms import (
     SearchAlgorithm, 
     RolloutPolicySearchAlgorithm,
     MCTSSearchAlgorithm,
+    ParallelTrackSearchAlgorithm,
 )
 from drift_object import DriftObjectCollection
 from currents import Currents
@@ -114,6 +115,7 @@ def get_algorithm(name: str) -> SearchAlgorithm:
         "trivial_greedy": TrivialGreedySearchAlgorithm,
         "rollout_policy": RolloutPolicySearchAlgorithm,
         "mcts": MCTSSearchAlgorithm,
+        "parallel_track": ParallelTrackSearchAlgorithm,
     }
 
     if name not in algorithms:
@@ -132,12 +134,14 @@ def run_experiment(
     output_file: str,
     start_step: int = 0,
     search_duration: int = None,
+    algorithm_name_2: str = None,
 ):
     """Run search simulation and export results.
     
     Args:
         start_step: Time step at which to begin search (default: 0)
         search_duration: Number of steps to run search (default: max_time_steps - start_step)
+        algorithm_name_2: Optional second algorithm for dual-platform simulation
     """
     if search_duration is None:
         search_duration = max_time_steps - start_step
@@ -145,7 +149,9 @@ def run_experiment(
     actual_max_steps = start_step + search_duration
     
     print(f"Initializing experiment...")
-    print(f"  Algorithm: {algorithm_name}")
+    print(f"  Algorithm 1: {algorithm_name}")
+    if algorithm_name_2:
+        print(f"  Algorithm 2: {algorithm_name_2}")
     print(f"  Search depth: {search_depth}")
     print(f"  Particles: {n_particles}")
     print(f"  Start step: {start_step}")
@@ -166,16 +172,30 @@ def run_experiment(
         dt=360.0,
     )
 
-    algorithm = get_algorithm(algorithm_name)
-
-    # Create simulation
-    sim = SearchSimulation(
-        grid=grid,
-        currents=currents,
-        drift_objects=drift_objects,
-        search_algorithm=algorithm,
-        max_time_steps=actual_max_steps,
-    )
+    # Setup algorithms
+    if algorithm_name_2:
+        # Dual-platform configuration
+        algorithms = {
+            "crewed": get_algorithm(algorithm_name),
+            "uncrewed": get_algorithm(algorithm_name_2),
+        }
+        sim = SearchSimulation(
+            grid=grid,
+            currents=currents,
+            drift_objects=drift_objects,
+            search_algorithms=algorithms,
+            max_time_steps=actual_max_steps,
+        )
+    else:
+        # Single algorithm configuration
+        algorithm = get_algorithm(algorithm_name)
+        sim = SearchSimulation(
+            grid=grid,
+            currents=currents,
+            drift_objects=drift_objects,
+            search_algorithm=algorithm,
+            max_time_steps=actual_max_steps,
+        )
 
     print(f"\nRunning simulation...")
 
@@ -189,9 +209,14 @@ def run_experiment(
         sim.drift_objects.step(sim.currents, time_idx=step_num, dt=sim.dt)
         sim.current_time_step += 1
         positions = drift_objects.get_positions()
-        for i in range(n_particles):
+        n_current = positions.shape[0]
+        for i in range(n_current):
             trajectories[step_num, i, 0] = positions[i, 0]
             trajectories[step_num, i, 1] = positions[i, 1]
+        # Fill remaining slots with NaN for removed objects
+        for i in range(n_current, n_particles):
+            trajectories[step_num, i, 0] = np.nan
+            trajectories[step_num, i, 1] = np.nan
         
         # Store probability surface for pre-search steps
         prob_surface = sim._compute_probability_surface()
@@ -200,9 +225,14 @@ def run_experiment(
 
     # Initial positions at start_step
     positions = drift_objects.get_positions()
-    for i in range(n_particles):
+    n_current = positions.shape[0]
+    for i in range(n_current):
         trajectories[start_step, i, 0] = positions[i, 0]
         trajectories[start_step, i, 1] = positions[i, 1]
+    # Fill remaining slots with NaN for removed objects
+    for i in range(n_current, n_particles):
+        trajectories[start_step, i, 0] = np.nan
+        trajectories[start_step, i, 1] = np.nan
 
     # Run search simulation
     for step_num in range(start_step, actual_max_steps):
@@ -216,40 +246,55 @@ def run_experiment(
         probability_surfaces.append(prob_list)
 
         # Store search results
-        search_results.append({
+        result = {
             "time_step": metrics.time_step,
             "time_label": metrics.time_label,
             "search_start_lat": float(metrics.search_start_lat),
             "search_start_lon": float(metrics.search_start_lon),
             "cells_searched": metrics.cells_searched,
             "probability_covered": float(metrics.probability_covered),
+            "objects_removed": metrics.objects_removed,
             "cells_searched_list": [(int(lat), int(lon)) for lat, lon in metrics.cells_searched_list],
-        })
+        }
+        # Include platform-specific metrics if available
+        if metrics.platform_metrics:
+            result["platform_metrics"] = metrics.platform_metrics
+        search_results.append(result)
 
-        # Store particle positions
+        # Store particle positions (handle case where objects have been removed)
         positions = drift_objects.get_positions()
-        for i in range(n_particles):
+        n_current = positions.shape[0]
+        for i in range(n_current):
             trajectories[step_num, i, 0] = positions[i, 0]
             trajectories[step_num, i, 1] = positions[i, 1]
+        # Fill remaining slots with NaN for removed objects
+        for i in range(n_current, n_particles):
+            trajectories[step_num, i, 0] = np.nan
+            trajectories[step_num, i, 1] = np.nan
 
     print(f"\nExporting results to {output_file}...")
 
     # Prepare output
-    output = {
-        "metadata": {
-            "algorithm": algorithm_name,
-            "search_depth": search_depth,
-            "n_particles": n_particles,
-            "start_step": start_step,
-            "search_duration": search_duration,
-            "total_time_steps": actual_max_steps,
-            "bounds": {
-                "min_lat": bounds[0],
-                "max_lat": bounds[1],
-                "min_lon": bounds[2],
-                "max_lon": bounds[3],
-            },
+    metadata = {
+        "algorithm": algorithm_name,
+        "search_depth": search_depth,
+        "n_particles": n_particles,
+        "start_step": start_step,
+        "search_duration": search_duration,
+        "total_time_steps": actual_max_steps,
+        "bounds": {
+            "min_lat": bounds[0],
+            "max_lat": bounds[1],
+            "min_lon": bounds[2],
+            "max_lon": bounds[3],
         },
+    }
+    # Add second algorithm if present
+    if algorithm_name_2:
+        metadata["algorithm_2"] = algorithm_name_2
+    
+    output = {
+        "metadata": metadata,
         "grid": {
             "lat_edges": sim.lat_edges.tolist(),
             "lon_edges": sim.lon_edges.tolist(),
@@ -269,8 +314,10 @@ def run_experiment(
     print(f"\nExperiment Summary:")
     print(f"  Total steps: {summary['total_steps']}")
     print(f"  Total cells searched: {summary['total_cells_searched']}")
+    print(f"  Initial objects: {summary['initial_objects']}")
+    print(f"  Total objects removed: {summary['total_objects_removed']}")
+    print(f"  Removal rate: {summary['removal_rate']:.4f} ({summary['removal_rate']*100:.2f}%)")
     print(f"  Avg probability per step: {summary['avg_probability_covered_per_step']:.6f}")
-    print(f"  Total probability covered: {summary['total_probability_covered']:.6f}")
 
 
 if __name__ == "__main__":
@@ -290,8 +337,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--algorithm",
         default="trivial_greedy",
-        choices=["trivial_greedy", "rollout_policy", "mcts"],
-        help="Search algorithm",
+        choices=["trivial_greedy", "rollout_policy", "mcts", "parallel_track"],
+        help="Search algorithm (crewed platform)",
+    )
+    parser.add_argument(
+        "--algorithm2",
+        default=None,
+        choices=["trivial_greedy", "rollout_policy", "mcts", "parallel_track"],
+        help="Optional second search algorithm for dual-platform simulation (uncrewed platform)",
     )
     parser.add_argument(
         "--depth",
@@ -341,4 +394,5 @@ if __name__ == "__main__":
         output_file=args.output,
         start_step=args.start_step,
         search_duration=args.search_duration,
+        algorithm_name_2=args.algorithm2,
     )

@@ -37,7 +37,10 @@ class SearchMetrics:
     search_start_lon: float
     cells_searched: int
     probability_covered: float
+    objects_removed: int = 0
     cells_searched_list: List[Tuple[int, int]] = field(default_factory=list)
+    # Platform-specific metrics (for dual-platform simulations)
+    platform_metrics: dict = field(default_factory=dict)  # {platform_name: {cells, prob_covered, objects_removed, cells_list}}
 
 class SearchSimulation:
     """
@@ -54,17 +57,34 @@ class SearchSimulation:
         grid: GridWorld,
         currents: Currents,
         drift_objects: DriftObjectCollection,
-        search_algorithm: SearchAlgorithm,
+        search_algorithm: SearchAlgorithm = None,
+        search_algorithms: dict = None,
         max_time_steps: int = 100,
         dt: float = 360.0,
+        pod: float = 0.8,
     ):
-        """Initialize simulation with grid, currents, particles, and search algorithm."""
+        """Initialize simulation with grid, currents, particles, and search algorithm(s).
+        
+        Args:
+            search_algorithm: Single search algorithm (legacy)
+            search_algorithms: Dict of {platform_name: SearchAlgorithm} for multi-platform search
+        """
         self.grid = grid
         self.currents = currents
         self.drift_objects = drift_objects
-        self.search_algorithm = search_algorithm
+        
+        # Support both single and multi-platform configurations
+        if search_algorithms is not None:
+            self.search_algorithms = search_algorithms
+        elif search_algorithm is not None:
+            self.search_algorithms = {"default": search_algorithm}
+        else:
+            raise ValueError("Either search_algorithm or search_algorithms must be provided")
+        
         self.max_time_steps = min(max_time_steps, currents.n_times - 1)
         self.dt = dt
+        self.pod = pod  # Probability of detection
+        self.initial_object_count = len(drift_objects.objects)  # Track initial count
 
         self._setup_grid_metadata()
         self.current_time_step = 0
@@ -142,22 +162,84 @@ class SearchSimulation:
         return (lat, lon)
 
     def step(self, search_depth: int) -> SearchMetrics:
-        """Execute one step: advance drift, compute probability, run search."""
+        """Execute one step: advance drift, compute probability, run search from all platforms."""
         self.drift_objects.step(self.currents, time_idx=self.current_time_step, dt=self.dt)
         self.probability_surface = self._compute_probability_surface()
         start_lat, start_lon = self._get_argmax_position(self.probability_surface)
-        cells_to_search = self.search_algorithm.search(
-            probability_surface=self.probability_surface,
-            lat_edges=self.lat_edges,
-            lon_edges=self.lon_edges,
-            start_lat=start_lat,
-            start_lon=start_lon,
-            depth=search_depth,
-            searched_cells=self.searched_cells,
-        )
+        
+        # Collect cells from all platforms
+        all_cells_to_search = []
+        platform_metrics = {}
+        platform_cells_map = {}  # Store cells per platform for visualization
+        first_platform_start_cell = None  # Track actual starting cell from first platform
+        first_platform_start_lat = None
+        first_platform_start_lon = None
+        
+        for i, (platform_name, algorithm) in enumerate(self.search_algorithms.items()):
+            # For subsequent platforms, use the starting cell from the first platform
+            if i > 0 and first_platform_start_cell is not None:
+                platform_start_lat = first_platform_start_lat
+                platform_start_lon = first_platform_start_lon
+            else:
+                platform_start_lat = start_lat
+                platform_start_lon = start_lon
+            
+            cells_to_search = algorithm.search(
+                probability_surface=self.probability_surface,
+                lat_edges=self.lat_edges,
+                lon_edges=self.lon_edges,
+                start_lat=platform_start_lat,
+                start_lon=platform_start_lon,
+                depth=search_depth,
+                searched_cells=self.searched_cells,
+            )
+            
+            # Capture the actual starting cell from the first platform
+            if first_platform_start_cell is None and len(cells_to_search) > 0:
+                first_platform_start_cell = cells_to_search[0]
+                lat_idx, lon_idx = first_platform_start_cell
+                # Convert cell indices to lat/lon (cell center)
+                first_platform_start_lat = 0.5 * (self.lat_edges[lat_idx] + self.lat_edges[lat_idx + 1])
+                first_platform_start_lon = 0.5 * (self.lon_edges[lon_idx] + self.lon_edges[lon_idx + 1])
+            
+            all_cells_to_search.extend(cells_to_search)
+            prob_covered = self._compute_probability_covered(cells_to_search)
+            platform_cells_map[platform_name] = cells_to_search
+            
+            platform_metrics[platform_name] = {
+                "cells_searched": len(cells_to_search),
+                "probability_covered": float(prob_covered),
+                "cells_list": [(int(lat), int(lon)) for lat, lon in cells_to_search],
+            }
+        
+        # Remove duplicates while preserving order
+        cells_to_search = list(dict.fromkeys(all_cells_to_search))
+        
         for cell in cells_to_search:
             self.searched_cells.add(cell)
         probability_covered = self._compute_probability_covered(cells_to_search)
+        
+        # Remove objects in searched cells based on probability of detection
+        objects_removed = self.drift_objects.remove_objects_in_cells(
+            cells=cells_to_search,
+            lat_edges=self.lat_edges,
+            lon_edges=self.lon_edges,
+            pod=self.pod
+        )
+        
+        # Track objects removed per platform (proportional to cells searched)
+        for platform_name in platform_metrics:
+            if len(cells_to_search) > 0:
+                platform_cells = platform_metrics[platform_name]["cells_searched"]
+                platform_metrics[platform_name]["objects_removed"] = int(
+                    objects_removed * platform_cells / len(cells_to_search)
+                )
+            else:
+                platform_metrics[platform_name]["objects_removed"] = 0
+        
+        # Recompute probability surface after removing objects
+        self.probability_surface = self._compute_probability_surface()
+        
         time_label = self.currents.get_time_label(self.current_time_step)
 
         metrics = SearchMetrics(
@@ -167,7 +249,9 @@ class SearchSimulation:
             search_start_lon=start_lon,
             cells_searched=len(cells_to_search),
             probability_covered=probability_covered,
+            objects_removed=objects_removed,
             cells_searched_list=cells_to_search,
+            platform_metrics=platform_metrics,
         )
 
         self.metrics.append(metrics)
@@ -187,6 +271,7 @@ class SearchSimulation:
                 total_prob += self.probability_surface[lat_idx, lon_idx]
 
         return float(total_prob)
+
 
     def run(self, search_depth: int, num_steps: Optional[int] = None) -> List[SearchMetrics]:
         """Run simulation for multiple steps."""
@@ -230,12 +315,16 @@ class SearchSimulation:
 
         prob_covered = [m.probability_covered for m in self.metrics]
         cells_searched = [m.cells_searched for m in self.metrics]
+        objects_removed = [m.objects_removed for m in self.metrics]
+        total_removed = int(np.sum(objects_removed))
 
         return {
             "total_steps": len(self.metrics),
             "total_cells_searched": len(self.searched_cells),
+            "initial_objects": self.initial_object_count,
+            "total_objects_removed": total_removed,
+            "removal_rate": float(total_removed / self.initial_object_count) if self.initial_object_count > 0 else 0.0,
             "avg_probability_covered_per_step": float(np.mean(prob_covered)),
-            "total_probability_covered": float(np.sum(prob_covered)),
             "avg_cells_per_step": float(np.mean(cells_searched)),
             "min_cells_per_step": int(np.min(cells_searched)),
             "max_cells_per_step": int(np.max(cells_searched)),
