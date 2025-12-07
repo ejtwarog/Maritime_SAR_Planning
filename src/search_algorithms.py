@@ -3,6 +3,8 @@
 from abc import ABC, abstractmethod
 from typing import List, Tuple
 import numpy as np
+import math
+import random
 
 
 class SearchAlgorithm(ABC):
@@ -25,7 +27,13 @@ class SearchAlgorithm(ABC):
         """
         pass
 
-    def _get_cell_indices(self, lat: float, lon: float, lat_edges: np.ndarray, lon_edges: np.ndarray) -> Tuple[int, int]:
+    def _get_cell_indices(
+        self,
+        lat: float,
+        lon: float,
+        lat_edges: np.ndarray,
+        lon_edges: np.ndarray
+    ) -> Tuple[int, int]:
         """Convert lat/lon to grid cell indices. Returns (-1, -1) if out of bounds."""
         lat_idx = np.searchsorted(lat_edges, lat) - 1
         lon_idx = np.searchsorted(lon_edges, lon) - 1
@@ -37,7 +45,13 @@ class SearchAlgorithm(ABC):
 
         return (lat_idx, lon_idx)
 
-    def _get_cell_center(self, lat_idx: int, lon_idx: int, lat_edges: np.ndarray, lon_edges: np.ndarray) -> Tuple[float, float]:
+    def _get_cell_center(
+        self,
+        lat_idx: int,
+        lon_idx: int,
+        lat_edges: np.ndarray,
+        lon_edges: np.ndarray
+    ) -> Tuple[float, float]:
         """Convert grid cell indices to lat/lon coordinates (cell center)."""
         lat = 0.5 * (lat_edges[lat_idx] + lat_edges[lat_idx + 1])
         lon = 0.5 * (lon_edges[lon_idx] + lon_edges[lon_idx + 1])
@@ -122,3 +136,447 @@ class TrivialGreedySearchAlgorithm(SearchAlgorithm):
             self.current_lat_idx, self.current_lon_idx = best_neighbor
 
         return cells
+
+
+from typing import Callable, Optional, Set, List, Tuple
+import numpy as np
+
+
+class RolloutPolicySearchAlgorithm(SearchAlgorithm):
+    """
+    Search algorithm that uses a Monte Carlo rollout planner to choose
+    the next cell, adapted from the original rollout_action() policy.
+
+    At each step, from the current cell it:
+      - considers four moves (N, S, E, W)
+      - for each, runs multiple random rollouts of length = horizon
+      - reward in each rollout = sum of PoD * belief over newly visited cells
+      - returns the neighbor cell corresponding to the action
+        with highest average simulated return.
+    """
+
+    def __init__(self, horizon: int = 8, n_rollouts: int = 8, pod: float = 0.8):
+        # Search state
+        self.current_lat_idx = None
+        self.current_lon_idx = None
+        self.path_visited = set()
+
+        # Rollout hyperparameters
+        self.horizon = horizon
+        self.n_rollouts = n_rollouts
+        self.pod = pod
+
+    def _rollout_policy(  # Added discounting of future rewards
+        self,
+        current_cell: Tuple[int, int],
+        probability_surface: np.ndarray,
+        searched_cells: set,
+        path_visited: set,
+    ) -> Tuple[int, int] | None:
+        """
+        Monte Carlo rollout planner adapted from rollout_action(), with:
+          - avoidance of NaNs / zero-probability cells
+          - discounting of future rewards (gamma < 1)
+          - mild bias against going into extremely low-probability regions
+        """
+        lat_idx, lon_idx = current_cell  # row, col
+        H, W = probability_surface.shape
+
+        # Base visited mask = everything we've already searched this mission
+        base_visited = np.zeros((H, W), dtype=bool)
+        for (li, lj) in searched_cells.union(path_visited):
+            if 0 <= li < H and 0 <= lj < W:
+                base_visited[li, lj] = True
+
+        # Define actions and deltas (N,S,E,W) in row/col space
+        ACTIONS = ["N", "S", "E", "W"]
+        DELTAS = {
+            "N": (-1, 0),  # move up: row-1
+            "S": (1, 0),   # move down: row+1
+            "E": (0, 1),   # move right: col+1
+            "W": (0, -1),  # move left:  col-1
+        }
+
+        # Global stats for masking/biasing
+        # Ignore NaNs when computing max
+        finite_probs = probability_surface[np.isfinite(probability_surface)]
+        if finite_probs.size == 0:
+            return None
+        max_prob = float(finite_probs.max())
+        # Threshold: don't start a rollout into cells that are *extremely* low compared to the max
+        MIN_START_FRAC = 1e-3
+        min_start_prob = MIN_START_FRAC * max_prob
+
+        gamma = 0.93  # discount factor for steps into the future
+
+        best_value = -1e9
+        best_next_cell = None
+
+        for action in ACTIONS:
+            dr, dc = DELTAS[action]
+
+            # First move from current cell
+            first_row = int(np.clip(lat_idx + dr, 0, H - 1))
+            first_col = int(np.clip(lon_idx + dc, 0, W - 1))
+
+            # Skip obviously bad starts: NaN or way below global max
+            p0 = probability_surface[first_row, first_col]
+            if not np.isfinite(p0) or p0 < min_start_prob:
+                # We'll still pick something if *all* actions are bad,
+                # but for now, just mark this as "low priority".
+                candidate_penalty = True
+            else:
+                candidate_penalty = False
+
+            total_return = 0.0
+
+            for _ in range(self.n_rollouts):
+                # Belief + visited copy for this rollout
+                b = probability_surface.copy()
+                visited = base_visited.copy()
+
+                rollout_reward = 0.0
+
+                r = first_row
+                c = first_col
+
+                # First step (t = 0)
+                if not visited[r, c] and np.isfinite(b[r, c]) and b[r, c] > 0.0:
+                    rollout_reward += self.pod * b[r, c]  # gamma^0 = 1
+                    visited[r, c] = True
+                    b[r, c] = b[r, c] * (1.0 - self.pod)
+
+                # Simulate the rest of the horizon with random actions
+                discount = gamma
+                for _ in range(self.horizon - 1):
+                    a2 = np.random.choice(ACTIONS)
+                    dr2, dc2 = DELTAS[a2]
+
+                    r = int(np.clip(r + dr2, 0, H - 1))
+                    c = int(np.clip(c + dc2, 0, W - 1))
+
+                    if (
+                        0 <= r < H
+                        and 0 <= c < W
+                        and not visited[r, c]
+                        and np.isfinite(b[r, c])
+                        and b[r, c] > 0.0
+                    ):
+                        rollout_reward += discount * (self.pod * b[r, c])
+                        visited[r, c] = True
+                        b[r, c] = b[r, c] * (1.0 - self.pod)
+
+                    discount *= gamma
+
+                total_return += rollout_reward
+
+            avg_return = total_return / float(self.n_rollouts)
+
+            # Soft penalty for starting in a super-low-probability cell
+            if candidate_penalty:
+                avg_return *= 0.5
+
+            if avg_return > best_value:
+                best_value = avg_return
+                best_next_cell = (first_row, first_col)
+
+        return best_next_cell
+
+    def search(
+        self,
+        probability_surface: np.ndarray,
+        lat_edges: np.ndarray,
+        lon_edges: np.ndarray,
+        start_lat: float,
+        start_lon: float,
+        depth: int,
+        searched_cells: set = None,
+    ) -> List[Tuple[int, int]]:
+        if searched_cells is None:
+            searched_cells = set()
+
+        if depth <= 0:
+            return []
+
+        # Initialize position on first call or if invalid
+        if self.current_lat_idx is None or self.current_lon_idx is None:
+            start_lat_idx, start_lon_idx = self._get_cell_indices(
+                start_lat, start_lon, lat_edges, lon_edges
+            )
+            if start_lat_idx == -1 or start_lon_idx == -1:
+                return []
+            self.current_lat_idx = start_lat_idx
+            self.current_lon_idx = start_lon_idx
+            self.path_visited = set()
+
+        cells: List[Tuple[int, int]] = []
+
+        for _ in range(depth):
+            current_cell = (self.current_lat_idx, self.current_lon_idx)
+
+            # Record current cell if not already searched
+            if current_cell not in searched_cells:
+                cells.append(current_cell)
+
+            # Use rollout-based policy to choose next cell
+            next_cell = self._rollout_policy(
+                current_cell=current_cell,
+                probability_surface=probability_surface,
+                searched_cells=searched_cells,
+                path_visited=self.path_visited,
+            )
+
+            if next_cell is None:
+                break
+
+            next_lat_idx, next_lon_idx = next_cell
+
+            # Bounds check (defensive)
+            if not (
+                0 <= next_lat_idx < probability_surface.shape[0]
+                and 0 <= next_lon_idx < probability_surface.shape[1]
+            ):
+                break
+
+            # Update path and current position
+            self.path_visited.add(current_cell)
+            self.current_lat_idx, self.current_lon_idx = next_lat_idx, next_lon_idx
+
+        return cells
+
+# MCTS implementation
+
+class _MCTSNode:
+    """
+    Internal node for MCTS over grid cells.
+    State is implicitly (lat_idx, lon_idx, depth_step).
+    """
+    def __init__(self):
+        self.N = 0          # visit count
+        self.Q = 0.0        # accumulated reward
+        self.children = {}  # (dlat, dlon) -> _MCTSNode
+
+
+class MCTSSearchAlgorithm(SearchAlgorithm):
+    """
+    Monte Carlo Tree Search planner for SAR grid search.
+    """
+
+    def __init__(self, horizon: int = 15, n_simulations: int = 200, c: float = 1.4):
+        self.horizon = horizon
+        self.n_simulations = n_simulations
+        self.c = c
+
+        # Persistent state across search steps
+        self.current_lat_idx = None
+        self.current_lon_idx = None
+        self.internal_visited = set()
+
+    def _neighbors(self, lat_idx: int, lon_idx: int, shape):
+        """Return 4-connected neighbors that stay within grid bounds."""
+        n_lat, n_lon = shape
+        directions = [
+            (-1, 0),  # up
+            (1, 0),   # down
+            (0, -1),  # left
+            (0, 1),   # right
+        ]
+        result = []
+        for dlat, dlon in directions:
+            nlat = lat_idx + dlat
+            nlon = lon_idx + dlon
+            if 0 <= nlat < n_lat and 0 <= nlon < n_lon:
+                result.append((dlat, dlon, nlat, nlon))
+        return result
+
+    def _mcts_plan(
+        self,
+        probability_surface: np.ndarray,
+        start_cell: tuple,
+        searched_cells: set,
+    ):
+        """Run MCTS from start_cell and return a path up to `horizon` steps."""
+        n_lat, n_lon = probability_surface.shape
+        root_key = (start_cell[0], start_cell[1], 0)
+        tree = {}
+
+        def get_node(key):
+            if key not in tree:
+                tree[key] = _MCTSNode()
+            return tree[key]
+
+        get_node(root_key)
+
+        # Simulations
+        for _ in range(self.n_simulations):
+            lat_idx, lon_idx = start_cell
+            depth = 0
+            sim_visited = set(searched_cells) | set(self.internal_visited)
+            sim_reward = 0.0
+            path = []
+
+            node_key = root_key
+            node = get_node(node_key)
+
+            # selection and expansion
+            while depth < self.horizon:
+                neighbors = self._neighbors(
+                    lat_idx, lon_idx, probability_surface.shape
+                )
+                if not neighbors:
+                    break
+
+                if not node.children:
+                    # expansion
+                    dlat, dlon, nlat, nlon = random.choice(neighbors)
+                    child_key = (nlat, nlon, depth + 1)
+                    child = get_node(child_key)
+                    node.children[(dlat, dlon)] = child
+
+                    lat_idx, lon_idx = nlat, nlon
+                    depth += 1
+                    path.append((node_key, (dlat, dlon), (lat_idx, lon_idx)))
+
+                    if (lat_idx, lon_idx) not in sim_visited:
+                        sim_reward += probability_surface[lat_idx, lon_idx]
+                        sim_visited.add((lat_idx, lon_idx))
+
+                    node_key = child_key
+                    node = child
+                    break
+
+                # selection via UCB1
+                best_ucb = -1e9
+                best_dir = None
+                best_child = None
+
+                for (dlat, dlon), child in node.children.items():
+                    if child.N == 0:
+                        ucb = float("inf")
+                    else:
+                        exploit = child.Q / child.N
+                        explore = self.c * math.sqrt(math.log(node.N + 1) / child.N)
+                        ucb = exploit + explore
+
+                    if ucb > best_ucb:
+                        best_ucb = ucb
+                        best_dir = (dlat, dlon)
+                        best_child = child
+
+                # step along best_dir
+                dlat, dlon = best_dir
+                lat_idx += dlat
+                lon_idx += dlon
+                depth += 1
+                path.append((node_key, (dlat, dlon), (lat_idx, lon_idx)))
+
+                if (lat_idx, lon_idx) not in sim_visited:
+                    sim_reward += probability_surface[lat_idx, lon_idx]
+                    sim_visited.add((lat_idx, lon_idx))
+
+                node_key = (lat_idx, lon_idx, depth)
+                node = get_node(node_key)
+
+            # Rollout
+            while depth < self.horizon:
+                neighbors = self._neighbors(
+                    lat_idx, lon_idx, probability_surface.shape
+                )
+                if not neighbors:
+                    break
+                dlat, dlon, nlat, nlon = random.choice(neighbors)
+                lat_idx, lon_idx = nlat, nlon
+                depth += 1
+
+                if (lat_idx, lon_idx) not in sim_visited:
+                    sim_reward += probability_surface[lat_idx, lon_idx]
+                    sim_visited.add((lat_idx, lon_idx))
+
+            # Backpropagation
+            for nk, _, _ in path:
+                node_back = get_node(nk)
+                node_back.N += 1
+                node_back.Q += sim_reward
+
+        # Extract the best path
+        best_path = []
+        cur_lat, cur_lon = start_cell
+        cur_depth = 0
+        cur_key = (cur_lat, cur_lon, cur_depth)
+
+        while cur_depth < self.horizon:
+            node = tree.get(cur_key, None)
+            if node is None or not node.children:
+                break
+
+            best_mean = -1e9
+            best_cell = None
+
+            for (dlat, dlon), child in node.children.items():
+                if child.N == 0:
+                    continue
+                mean_val = child.Q / child.N
+                nlat = cur_lat + dlat
+                nlon = cur_lon + dlon
+                if mean_val > best_mean:
+                    best_mean = mean_val
+                    best_cell = (nlat, nlon)
+
+            if best_cell is None:
+                break
+
+            best_path.append(best_cell)
+            cur_lat, cur_lon = best_cell
+            cur_depth += 1
+            cur_key = (cur_lat, cur_lon, cur_depth)
+
+        return best_path
+
+    def search(
+        self,
+        probability_surface: np.ndarray,
+        lat_edges: np.ndarray,
+        lon_edges: np.ndarray,
+        start_lat: float,
+        start_lon: float,
+        depth: int,
+        searched_cells: set = None,
+    ) -> List[Tuple[int, int]]:
+        if searched_cells is None:
+            searched_cells = set()
+
+        if depth <= 0:
+            return []
+
+        # Initialize current position if needed
+        if self.current_lat_idx is None or self.current_lon_idx is None:
+            lat_idx, lon_idx = self._get_cell_indices(
+                start_lat, start_lon, lat_edges, lon_edges
+            )
+            if lat_idx == -1 or lon_idx == -1:
+                return []
+            self.current_lat_idx = lat_idx
+            self.current_lon_idx = lon_idx
+
+        start_cell = (self.current_lat_idx, self.current_lon_idx)
+
+        # Run MCTS
+        planned = self._mcts_plan(
+            probability_surface,
+            start_cell=start_cell,
+            searched_cells=searched_cells,
+        )
+
+        if not planned:
+            return []
+
+        # Take at most `depth` steps from the planned path
+        output = planned[:depth]
+        if not output:
+            return []
+
+        # Update internal position and visited set
+        self.current_lat_idx, self.current_lon_idx = output[-1]
+        self.internal_visited.update(output)
+
+        return output
